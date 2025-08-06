@@ -1,0 +1,759 @@
+---
+title: "Bayesian Hierarchical wOBA Projection"
+author: "Max Wassarman"
+output: pdf_document
+date: "2025-08-05"
+---
+
+# Overview
+
+Implementation of Bayesian hierarchical model to project wOBA. Combines Marcel projections with wOBA components and uses player, season and team random effects.
+
+## Dependencies
+
+```{r message=FALSE,warning=FALSE}
+library(tidyverse)
+library(Metrics)
+library(brms)
+library(splines)
+library(corrplot)
+library(bayesplot)
+library(rstan)
+library(posterior)
+library(cmdstanr) # Note: install_cmdstan() required for first-time setup
+library(gt)
+library(gtExtras)
+```
+
+## Data Loading
+
+```{r message=FALSE}
+# Load FanGraphs data and filter for players with sufficient plate appearances
+data <- read_csv("fangraphs_04-24.csv") |>
+  filter(PA > 50)
+```
+
+# Marcel Projection
+
+Weighted average of recent performance with regression towards league mean. More recent seasons get higher weights (5/4/3), and players with fewer plate appearances are regressed more heavily toward league average.
+
+## Data Preparation
+
+```{r}
+# Split data into historical and current
+historical_data <- data |>
+  filter(Season < 2020) |>
+  select(IDfg, Season, Name, Team, Age, AB, PA, wOBA)
+
+current_data <- data |>
+  filter(Season < 2024) |>
+  select(IDfg, Season, Name, Team, Age, AB, PA, wOBA)
+```
+
+## League Average Calculation
+
+```{r}
+league_avg <- historical_data |>
+  group_by(Season) |>
+  summarize(lg_wOBA = mean(wOBA, na.rm = TRUE))
+```
+
+## Marcel Projection Implementation
+
+```{r}
+model_data <- historical_data |>
+  arrange(IDfg, Season) |>
+  group_by(IDfg) |>
+  mutate(
+    # Create lagged variables for previous seasons
+    wOBA_prev1 = lag(wOBA, 1),
+    PA_prev1 = lag(PA, 1),
+    wOBA_prev2 = lag(wOBA, 2),
+    PA_prev2 = lag(PA, 2),
+    wOBA_prev3 = lag(wOBA, 3),
+    PA_prev3 = lag(PA, 3),
+    
+    # Count years of avalible data
+    years_of_data = (!is.na(wOBA_prev1)) + 
+                    (!is.na(wOBA_prev2)) + 
+                    (!is.na(wOBA_prev3))
+  ) |>
+  ungroup() |>
+  left_join(league_avg, by = "Season")
+
+# Calculate weighted averages based on avalible data
+model_data <- model_data |>
+  mutate(
+    # 3 year
+    wOBA_marcel_3yr = case_when(
+      years_of_data >= 3 ~ (5*wOBA_prev1*PA_prev1 + 4*wOBA_prev2*PA_prev2 + 3*wOBA_prev3*PA_prev3) / 
+                      (5*PA_prev1 + 4*PA_prev2 + 3*PA_prev3),
+      TRUE ~ NA_real_
+    ),
+    
+    # 2 year
+    wOBA_marcel_2yr = case_when(
+      years_of_data >= 2 ~ (5*wOBA_prev1*PA_prev1 + 4*wOBA_prev2*PA_prev2) / 
+                      (5*PA_prev1 + 4*PA_prev2),
+      TRUE ~ NA_real_
+    ),
+    
+    # 1 year
+    wOBA_marcel_1yr = case_when(
+      years_of_data >= 1 ~ wOBA_prev1,
+      TRUE ~ NA_real_
+    ),
+    
+    # Get correct calculation based on available data
+    wOBA_marcel_temp = case_when(
+      years_of_data == 3 ~ wOBA_marcel_3yr,
+      years_of_data == 2 ~ wOBA_marcel_2yr,
+      years_of_data == 1 ~ wOBA_marcel_1yr,
+      TRUE ~ NA_real_
+    ),
+    
+    # Get pa for regression to mean
+    pa_regression = case_when(
+      years_of_data == 3 ~ PA_prev1 + PA_prev2 + PA_prev3,
+      years_of_data == 2 ~ PA_prev1 + PA_prev2,
+      years_of_data == 1 ~ PA_prev1,
+      TRUE ~ 0
+    ),
+    
+    # Players with fewer PA regressed more toward league average
+    reg_weight = pa_regression / (pa_regression + 1500),
+    
+    # Final Marcel calculation
+    wOBA_marcel = reg_weight * wOBA_marcel_temp + (1 - reg_weight) * lg_wOBA
+  ) |>
+  filter(!is.na(wOBA_marcel))
+```
+
+# Component Analysis
+
+A simple effort to help capture player skills that may not be fully reflected in wOBA alone.
+
+## Component Data Preparation
+
+```{r}
+# Join component statistics to Marcel projections
+component_data <- model_data |>
+  left_join(data |>  
+      select(IDfg, Season, 
+             AB, PA, BB, SO, `1B`, `2B`, `3B`, HR, HBP, SF,
+             `K%`, `BB%`, `Hard%`, `Pull%`, `GB%`),
+    by = c("IDfg", "Season")
+  ) |>
+  mutate(
+    # Calculate rate statistics per at-bat
+    Singles_rate = `1B` / AB.x,
+    Doubles_rate = `2B` / AB.x,
+    Triples_rate = `3B` / AB.x,
+    HR_rate = HR / AB.x,
+    HBP_rate = HBP / AB.x,
+    SF_rate = SF / AB.x,
+    Hard_pct = `Hard%`,
+    Pull_pct = `Pull%`,
+    GB_pct = `GB%`
+  )
+```
+
+## Correlation Analysis
+
+```{r}
+# Examine correlations between Marcel projections and component statistics
+cor_matrix <- component_data |>
+  select(
+    wOBA_marcel, 
+    Singles_rate, Doubles_rate, Triples_rate, HR_rate, HBP_rate, SF_rate,
+    Hard_pct, Pull_pct, GB_pct
+  ) |>
+  cor(use = "pairwise.complete.obs")
+
+# Visualize correlation structure
+corrplot(cor_matrix, method = "color", type = "upper", 
+         order = "hclust", diag = FALSE, tl.col = "black")
+```
+
+## Component Residuals
+
+```{r}
+# Create linear models to predict each component from Marcel projection
+# Residuals capture component-specific skills independent of overall performance
+options(scipen = 999)
+
+# Base relationship: wOBA vs Marcel projection
+print("Base wOBA ~ Marcel relationship:")
+print(summary(lm(wOBA ~ wOBA_marcel, data = model_data)))
+
+# Component models: Each component predicted by Marcel projection
+singles_model <- lm(Singles_rate ~ wOBA_marcel, data = component_data)
+doubles_model <- lm(Doubles_rate ~ wOBA_marcel, data = component_data)
+triples_model <- lm(Triples_rate ~ wOBA_marcel, data = component_data)
+hr_model <- lm(HR_rate ~ wOBA_marcel, data = component_data)
+hbp_model <- lm(HBP_rate ~ wOBA_marcel, data = component_data)
+sf_model <- lm(SF_rate ~ wOBA_marcel, data = component_data)
+hard_model <- lm(Hard_pct ~ wOBA_marcel, data = component_data)
+pull_model <- lm(Pull_pct ~ wOBA_marcel, data = component_data)
+gb_model <- lm(GB_pct ~ wOBA_marcel, data = component_data)
+
+# Calculate residuals: difference between actual and expected component values
+component_data <- component_data |>
+  mutate(
+    Singles_rate_resid = residuals(singles_model),
+    Doubles_rate_resid = residuals(doubles_model),
+    Triples_rate_resid = residuals(triples_model),
+    HR_rate_resid = residuals(hr_model),
+    HBP_rate_resid = residuals(hbp_model),
+    SF_rate_resid = residuals(sf_model),
+    Hard_pct_resid = residuals(hard_model),
+    Pull_pct_resid = residuals(pull_model),
+    GB_pct_resid = residuals(gb_model)
+  )
+```
+
+# Bayesian Hierarchical Model
+
+## Priors
+
+Priors based on domain knowledge and previous model fits
+
+```{r}
+priors <- c(
+  # Intercept: Below league average wOBA
+  prior(normal(-0.86, 0.01), class = "Intercept"),
+  
+  # Marcel coefficient: Strong positive relationship with some uncertainty
+  prior(normal(1.7, 0.37), class = "b", coef = "wOBA_marcel"),
+  
+  # Component residuals: Rough Priors. Have not dug into these. Seemed quite
+  # prone to overfitting so tightened down
+  prior(normal(0, 0.005), class = "b", coef = "Singles_rate_resid"),
+  prior(normal(0, 0.005), class = "b", coef = "Doubles_rate_resid"),
+  prior(normal(0, 0.005), class = "b", coef = "Triples_rate_resid"),
+  prior(normal(0, 0.005), class = "b", coef = "HR_rate_resid"),
+  prior(normal(0, 0.005), class = "b", coef = "HBP_rate_resid"),
+  prior(normal(0, 0.005), class = "b", coef = "SF_rate_resid"),
+  
+  # Age spline coefficients: Trying to allow for more realistic age curves 
+  prior(normal(0, 0.03), class = "b", coef = "nsAgedfEQ41"),
+  prior(normal(0, 0.03), class = "b", coef = "nsAgedfEQ42"),
+  prior(normal(0, 0.03), class = "b", coef = "nsAgedfEQ43"),
+  prior(normal(0, 0.03), class = "b", coef = "nsAgedfEQ44"),
+  
+  # Player effects: Some players are outliers (heavy tails observed in QQ plot)
+  prior(student_t(3, 0, 0.1), class = "sd", group = "IDfg"),
+  
+  # Season effects: Normal (some minor deviation at both extremes)
+  prior(normal(0, 0.05), class = "sd", group = "Season"),
+  
+  # Team effects: Normal (QQ plot showed good normality)
+  prior(normal(0, 0.05), class = "sd", group = "Team"),
+  
+  # Residual error: Overall uncertainty
+  prior(normal(0, 0.05), class = "sigma")
+)
+```
+
+## Model Fitting
+
+Formula: wOBA predicted by Marcel + component residuals + age + random effects
+
+```{r warning=FALSE}
+# Depending on computer will have to change with this
+# Also just the current version that I ran (included everything). 
+# Testing some things out.
+model <- brm(
+  wOBA ~ wOBA_marcel + 
+         Singles_rate_resid + Doubles_rate_resid + Triples_rate_resid + 
+         HR_rate_resid + HBP_rate_resid + SF_rate_resid +
+         Hard_pct_resid + Pull_pct_resid + GB_pct_resid +
+         ns(Age, df = 4) + 
+         (1 | IDfg) + (1 | Season) + (1 | Team),
+  data = component_data,
+  family = gaussian(),
+  prior = priors,
+  warmup = 1000,
+  chains = 4, iter = 5000, seed = 0804,
+  backend = "cmdstanr",
+  cores = 6
+)
+```
+
+## Save the model
+
+```{r}
+# Save the fitted model for future use
+saveRDS(model, file = "baseball_woba_model_2024.rds")
+```
+
+## Model Diagnostics
+
+```{r}
+# Model summary and diagnostics
+print(summary(model))
+```
+
+```{r}
+# Posterior predictive check: Compare model predictions to actual data
+pp_check_plot <- pp_check(model) + 
+  theme_bw() +
+  theme(panel.background = element_rect(fill = '#eeeeee')) +
+  labs(title = "Posterior Predictive Check",
+       subtitle = "Model predictions (light blue) vs observed data (dark blue)")
+print(pp_check_plot)
+```
+
+```{r}
+# MCMC trace plots: Check for convergence
+chains_plot <- mcmc_plot(model, type = "trace") + 
+  theme_bw() +
+  theme(panel.background = element_rect(fill = '#eeeeee')) +
+  labs(title = "MCMC Trace Plots")
+print(chains_plot)
+```
+
+```{r}
+# R-hat convergence diagnostic
+rhat_values <- rhat(model)
+print(summary(rhat_values))
+```
+
+```{r}
+# Alternative model summary visualization
+plot(model, type = "mermaid")
+```
+
+## Parameter Estimates
+
+```{r}
+# Parameter estimates with credible intervals
+mcmc_plot(model, type = "intervals") +
+  theme_minimal() +
+  labs(title = "Parameter Estimates with 95% Credible Intervals")
+```
+
+# Model Projections for 2024
+
+Generate projections for 2024 season using the fitted model.
+
+## Projections Data Preparation
+
+```{r}
+# Calculate 2023 league average for regression to mean
+lg_wOBA_2023 <- current_data |>
+  filter(Season == 2023) |>
+  group_by(Season) |>
+  summarize(lg_wOBA = mean(wOBA, na.rm = TRUE)) |>
+  pull(lg_wOBA)
+
+# Create Marcel projections for 2024 using data through 2023
+projection_data <- current_data |>
+  filter(Season < 2024) |>
+  arrange(IDfg, Season) |>
+  group_by(IDfg) |>
+  filter(any(Season == 2023)) |>  # Only players active in 2023
+  summarize(
+    # Player information for 2024
+    Name = last(Name),
+    Team = last(Team),
+    Age = last(Age) + 1,  # Age up by one year
+    Season = 2024,
+    
+    # Historical performance data
+    wOBA_prev1 = last(wOBA),
+    PA_prev1 = last(PA),
+    
+    wOBA_prev2 = if(n() >= 2) nth(wOBA, n()-1) else NA_real_,
+    PA_prev2 = if(n() >= 2) nth(PA, n()-1) else NA_real_,
+    
+    wOBA_prev3 = if(n() >= 3) nth(wOBA, n()-2) else NA_real_,
+    PA_prev3 = if(n() >= 3) nth(PA, n()-2) else NA_real_,
+    
+    # Count available years
+    years_of_data = sum(!is.na(c(last(wOBA), 
+                                 if(n() >= 2) nth(wOBA, n()-1) else NA, 
+                                 if(n() >= 3) nth(wOBA, n()-2) else NA)))
+  ) |>
+  mutate(
+    # Apply Marcel projection
+    wOBA_marcel_3yr = case_when(
+      years_of_data >= 3 ~ (5*wOBA_prev1*PA_prev1 + 4*wOBA_prev2*PA_prev2 + 3*wOBA_prev3*PA_prev3) / 
+                      (5*PA_prev1 + 4*PA_prev2 + 3*PA_prev3),
+      TRUE ~ NA_real_
+    ),
+    
+    wOBA_marcel_2yr = case_when(
+      years_of_data >= 2 ~ (5*wOBA_prev1*PA_prev1 + 4*wOBA_prev2*PA_prev2) / 
+                      (5*PA_prev1 + 4*PA_prev2),
+      TRUE ~ NA_real_
+    ),
+    
+    wOBA_marcel_1yr = wOBA_prev1,
+    
+    wOBA_marcel_temp = case_when(
+      years_of_data == 3 ~ wOBA_marcel_3yr,
+      years_of_data == 2 ~ wOBA_marcel_2yr,
+      years_of_data == 1 ~ wOBA_marcel_1yr,
+      TRUE ~ NA_real_
+    ),
+    
+    pa_regression = case_when(
+      years_of_data == 3 ~ PA_prev1 + PA_prev2 + PA_prev3,
+      years_of_data == 2 ~ PA_prev1 + PA_prev2,
+      years_of_data == 1 ~ PA_prev1,
+      TRUE ~ 0
+    ),
+    
+    reg_weight = pa_regression / (pa_regression + 1500),
+    
+    # Final Marcel projection for 2024
+    wOBA_marcel = reg_weight * wOBA_marcel_temp + 
+      (1 - reg_weight) * lg_wOBA_2023
+  ) |>
+  filter(!is.na(wOBA_marcel))
+```
+
+## Component Statistics for Projections
+
+```{r}
+# Add 2023 component statistics for projection
+projection_component_data <- projection_data |>
+  left_join(
+    data |> 
+      filter(Season == 2023) |>
+      select(IDfg, AB, PA, `1B`, `2B`, `3B`, HR, HBP, SF,
+             `Hard%`, `Pull%`, `GB%`),
+    by = "IDfg"
+  ) |>
+  mutate(
+    # Calculate 2023 component rates
+    Singles_rate = `1B` / AB,
+    Doubles_rate = `2B` / AB,
+    Triples_rate = `3B` / AB,
+    HR_rate = HR / AB,
+    HBP_rate = HBP / PA,
+    SF_rate = SF / PA,
+    Hard_pct = `Hard%`,
+    Pull_pct = `Pull%`,
+    GB_pct = `GB%`
+  )
+
+# Calculate component residuals using historical models
+projection_component_data <- projection_component_data |>
+  mutate(
+    Singles_rate_resid = Singles_rate - predict(
+      singles_model, newdata = projection_component_data
+      ),
+    Doubles_rate_resid = Doubles_rate - predict(
+      doubles_model, newdata = projection_component_data
+      ),
+    Triples_rate_resid = Triples_rate - predict(
+      triples_model, newdata = projection_component_data
+      ),
+    HR_rate_resid = HR_rate - predict(
+      hr_model, newdata = projection_component_data
+      ),
+    HBP_rate_resid = HBP_rate - predict(
+      hbp_model, newdata = projection_component_data
+      ),
+    SF_rate_resid = SF_rate - predict(
+      sf_model, newdata = projection_component_data
+      ),
+    Hard_pct_resid = Hard_pct - predict(
+      hard_model, newdata = projection_component_data
+      ),
+    Pull_pct_resid = Pull_pct - predict(
+      pull_model, newdata = projection_component_data
+      ),
+    GB_pct_resid = GB_pct - predict(
+      gb_model, newdata = projection_component_data
+      )
+  )
+```
+
+## Generate Posterior Predictions
+
+```{r}
+# Generate posterior predictions
+set.seed(0804)
+posterior_projection <- posterior_predict(model, 
+                                        newdata = projection_component_data, 
+                                        allow_new_levels = TRUE)
+
+# Summarize posterior predictions
+projection_component_data <- projection_component_data |>
+  mutate(
+    # Point estimate: posterior mean
+    wOBA_proj = colMeans(posterior_projection),
+    
+    # Uncertainty intervals: 80% credible interval for now
+    wOBA_proj_lower = apply(posterior_projection, 2, quantile, probs = 0.10),
+    wOBA_proj_upper = apply(posterior_projection, 2, quantile, probs = 0.90)
+  ) |>
+  select(IDfg, Season, Name, Team, Age, wOBA_proj, wOBA_proj_lower, 
+         wOBA_proj_upper, wOBA_marcel)
+```
+
+# Model Validation
+
+Compare the 2024 projections to actual performance to evaluate models accuracy.
+
+## Actual vs Projected Performance
+
+```{r}
+# Load actual 2024 performance
+wOBA_2024 <- data |>
+  filter(Season == 2024) |>
+  select(IDfg, wOBA)
+
+# Join projections with actual performance
+validation_data <- left_join(
+  projection_component_data, wOBA_2024, by = 'IDfg') |>
+  rename(wOBA_actual_2024 = wOBA) |>
+  drop_na()  # Keep only players with both projections and actual data
+```
+
+# Validation Plots
+
+```{r}
+# Scatter plot: Projected vs Actual wOBA
+proj_vs_actual <- ggplot(
+  validation_data, aes(x = wOBA_proj, y = wOBA_actual_2024)) +
+  geom_point(alpha = 0.6, color = "#2a5674") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color= "#b13f64") +
+  geom_smooth(method = "lm", se = FALSE, color = "#2a5674") +
+  theme_bw() +
+  theme(panel.background = element_rect(fill = '#eeeeee')) +
+  labs(title = "2024 Projections vs Actual Performance",
+       x = "Projected wOBA", 
+       y = "Actual wOBA",
+       subtitle = "Red line = perfect accuracy, Blue line = model fit")
+
+# Error distribution
+error_dist <- validation_data |>
+  mutate(error = wOBA_actual_2024 - wOBA_proj) |>
+  ggplot(aes(x = error)) +
+  geom_density(fill = "#b13f64", alpha = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = seq(-0.10, 0.10, 0.05)) +
+  theme_bw() +
+  theme(panel.background = element_rect(fill = '#eeeeee')) +
+  labs(title = "Projection Error Distribution",
+       x = "Error (Actual - Projected)",
+       y = "Density")
+
+print(proj_vs_actual)
+print(error_dist)
+```
+
+## Model Performance Metrics
+
+```{r}
+# Calculate model performance
+validation_summary <- validation_data |>
+  summarise(
+    n_players = n(),
+    mean_abs_error = round(
+      mean(
+        abs(
+          wOBA_actual_2024 - wOBA_proj), na.rm = TRUE), 4),
+    root_mean_sq_error = round(
+      sqrt(
+        mean(
+          (wOBA_actual_2024 - wOBA_proj)^2, na.rm = TRUE)), 4),
+    correlation = round(
+      cor(
+        wOBA_proj, wOBA_actual_2024, use = "complete.obs"), 3),
+    r_squared = round(
+      cor(
+        wOBA_proj, wOBA_actual_2024, use = "complete.obs")^2, 3)
+  )
+
+print("Model Performance Summary:")
+print(validation_summary)
+
+# Just curious what this says
+print("Bayesian R-squared:")
+print(bayes_R2(model))
+```
+
+# Team Level Analysis
+
+## Team Projections Accuracy
+
+```{r}
+# Update team affiliations to 2024 (players may have changed teams)
+team_data_2024 <- data |>
+  filter(Season == 2024) |>
+  select(IDfg, Team) |>
+  distinct()
+
+final_projections <- validation_data |>
+  select(-Team) |>
+  left_join(team_data_2024, by = "IDfg") |>
+  mutate(error = abs(wOBA_actual_2024 - wOBA_proj))
+
+# Team projection accuracy ranking
+team_accuracy <- final_projections |>
+  na.omit() |>
+  group_by(Team) |>
+  summarise(
+    n_players = n(),
+    mean_error = round(mean(error), 3),
+    .groups = "drop"
+  ) |>
+  arrange(mean_error)
+
+print("Teams with Most Accurate Projections:")
+print(head(team_accuracy, 10))
+print("Teams with Least Accurate Projections:")
+print(tail(team_accuracy, 10))
+```
+
+## Individual Team Visualizations
+
+```{r}
+# Example: Philadelphia Phillies projection accuracy
+phillies_plot <- final_projections |>
+  filter(Team == "PHI") |>
+  ggplot(aes(x = reorder(Name, wOBA_actual_2024), y = wOBA_proj)) +
+  # Prediction intervals
+  geom_errorbar(aes(ymin = wOBA_proj_lower, ymax = wOBA_proj_upper),
+                width = 0, color = "black", size = 0.4) +
+  # Projected values
+  geom_point(aes(y = wOBA_proj, color = "Projected"),
+             size = 3, shape = 16) +
+  # Actual values  
+  geom_point(aes(y = wOBA_actual_2024, color = "Actual"),
+             size = 3, shape = 17) +
+  scale_color_manual(name = "wOBA Values",
+                    values = c("Projected" = "#2a5674", 
+                              "Actual" = "#b13f64")) +
+  guides(color = guide_legend(override.aes = list(
+    shape = c(17, 16),
+    size = c(3, 3)
+  ))) +
+  coord_flip() +
+  theme_bw() +
+  theme(
+    panel.background = element_rect(fill = '#eeeeee'),
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  ) +
+  labs(
+    title = 
+      "Philadelphia Phillies: 2024 wOBA Projections vs. Actual Performance",
+    subtitle = "Black bars indicate projection credible intervals",
+    x = "Player",
+    y = "wOBA"
+  )
+
+print(phillies_plot)
+```
+
+# Summary Tables
+
+## Best and Worst Projections
+
+```{r}
+# Most accurate individual projections
+best_projections <- final_projections |>
+  na.omit() |>
+  arrange(error) |>
+  head(10) |>
+  select(Name, Team, wOBA_proj, wOBA_actual_2024, error) |>
+  gt() |>
+  tab_header(
+    title = "Most Accurate Player Projections",
+    subtitle = 
+      "Players with smallest absolute error between projected and actual 2024 wOBA"
+  ) |>
+  fmt_number(
+    columns = c(wOBA_proj, wOBA_actual_2024, error),
+    decimals = 3
+  ) |>
+  cols_label(
+    Name = "Player",
+    Team = "Team", 
+    wOBA_proj = "Projected wOBA",
+    wOBA_actual_2024 = "Actual wOBA",
+    error = "Absolute Error"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e6f7e9"),
+    locations = cells_body()
+  )
+
+# Least accurate individual projections  
+worst_projections <- final_projections |>
+  na.omit() |>
+  arrange(desc(error)) |>
+  head(10) |>
+  select(Name, Team, wOBA_proj, wOBA_actual_2024, error) |>
+  gt() |>
+  tab_header(
+    title = "Least Accurate Player Projections", 
+    subtitle = 
+      "Players with largest absolute error between projected and actual 2024 wOBA"
+  ) |>
+  fmt_number(
+    columns = c(wOBA_proj, wOBA_actual_2024, error),
+    decimals = 3
+  ) |>
+  cols_label(
+    Name = "Player",
+    Team = "Team",
+    wOBA_proj = "Projected wOBA", 
+    wOBA_actual_2024 = "Actual wOBA",
+    error = "Absolute Error"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#fbebeb"),
+    locations = cells_body()
+  )
+
+#gt_two_column_layout(list(best_projections, worst_projections))
+
+combined_data <- bind_rows(
+  final_projections |>
+    na.omit() |>
+    arrange(error) |>
+    head(5) |>
+    mutate(category = "Most Accurate"),
+  final_projections |>
+    na.omit() |>
+    arrange(desc(error)) |>
+    head(5) |>
+    mutate(category = "Least Accurate")
+)
+
+combined_projections <- combined_data |>
+  select(category, Name, Team, wOBA_proj, wOBA_actual_2024, error) |>
+  gt(groupname_col = "category") |>
+  tab_header(
+    title = "Projection Accuracy Comparison",
+    subtitle = "Most and least accurate 2024 wOBA projections"
+  ) |>
+  fmt_number(
+    columns = c(wOBA_proj, wOBA_actual_2024, error),
+    decimals = 3
+  ) |>
+  cols_label(
+    Name = "Player",
+    Team = "Team",
+    wOBA_proj = "Projected wOBA",
+    wOBA_actual_2024 = "Actual wOBA", 
+    error = "Absolute Error"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e6f7e9"),
+    locations = cells_body(rows = category == "Most Accurate")
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#fbebeb"),
+    locations = cells_body(rows = category == "Least Accurate")
+  )
+
+# print(combined_projections)
+```
